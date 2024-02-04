@@ -1,0 +1,381 @@
+---
+title: "trade-report"
+format: html
+html: embed-resources
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(ffoptim)
+library(tidyverse)
+library(glue)
+library(gt)
+library(powerjoin)
+library(gtExtras)
+library(RColorBrewer)
+
+TEAM <- 'Black Wilson'
+pal <- RColorBrewer::brewer.pal(n = 8, name = "Set2")
+RColorBrewer::display.brewer.pal(n = 8, name = "Set2")
+pgreen <- "#A6D854"
+pred <- "#FC8D62"
+# color_scale <- colorRamp(c(pred, pgreen))(100)
+
+
+# Pull Lookups #
+all_owned_assets <- FFDATA$all_rostered_assets %>%
+  select(-c(roster, picks)) %>%
+  unnest(all_assets) %>%
+  mutate(
+    player_id = if_else(is.na(player_id), glue("raw_pick--{raw_pick}"), player_id),
+    player_name = if_else(is.na(player_id), player_id, player_name)
+  )
+all_owned_players <- all_owned_assets %>%
+  filter(!str_detect(player_name, "^raw_pick--")) %>%
+  mutate(scaled_value = scales::rescale(value_2qb))
+all_owned_draft_picks <-
+  anti_join(all_owned_assets, all_owned_players, by = join_by(player_id)) %>%
+  janitor::remove_empty('cols')
+all_unowned_players <- FFDATA$non_rostered %>%
+  rename(player_id = id,
+         player_name = player)
+all_league_players <-
+  bind_rows(all_owned_players, all_unowned_players) %>%
+  janitor::remove_empty('cols')
+all_league_assets <-
+  bind_rows(all_league_players, all_owned_draft_picks) %>%
+  janitor::remove_empty('cols')
+
+# Current Team Lookups #
+cur_roster <- all_owned_players %>%
+  filter(franchise_name == TEAM)
+cur_lineup <- opt_lineup(id = cur_roster$player_id,
+                         pos = cur_roster$pos,
+                         val = cur_roster$value_2qb) %>%
+  rename(player_id = id) %>%
+  power_left_join(y = {
+    cur_roster
+  },
+  by = join_by(player_id),
+  conflict = coalesce_xy)
+
+# Addatives #
+player_lookups <- nflreadr::load_ff_playerids() %>%
+  select(player_id = sleeper_id,
+         player_name = name,
+         team,
+         gsis_id) %>%
+  left_join(y = {
+    nflreadr::load_players() %>%
+      select(gsis_id,
+             headshot) %>%
+      drop_na()
+  })
+
+
+```
+
+## Waiver Wire
+
+```{r}
+
+non_rostered <- ffoptim::FFDATA$non_rostered %>%
+  select(player_id = id,  player_name = player, pos, val = value_2qb)
+
+player_strategy <- build_non_roster_player_strategy(
+  ordered_roster = cur_lineup,
+  non_rostered_data = non_rostered,
+  max_spots = 25
+)
+
+```
+
+### Top Non-Rostered
+
+```{r}
+
+non_rostered %>%
+  slice_max(order_by = val, n = 10) %>%
+  left_join(y = {
+    select(player_lookups,
+           player_id,
+           headshot)
+  }) %>%
+  gt() %>%
+  # labels
+  cols_hide(player_id) %>%
+  cols_move(headshot, after = player_name) %>%
+  cols_label(player_name = "Player Name",
+             pos = "Pos",
+             val = "Value") %>%
+  # colors
+  gt_img_rows(columns = headshot) %>%
+  # theming
+  gt_theme_538()
+
+
+```
+
+### Waiver Adds to Make
+
+```{r}
+
+tibble(
+add_players = player_strategy$add_players,
+drop_players = player_strategy$drop_players
+) %>%
+  left_join(
+    y = {
+      select(non_rostered, pos, player_name, val)
+    },
+    by = c('add_players' = 'player_name')
+  ) %>%
+  left_join(
+    y = {
+      select(all_owned_players, pos, player_name, val = value_2qb)
+    },
+    by = c('drop_players' = 'player_name')
+  ) %>%
+  left_join(y = {
+    select(player_lookups, player_name, headshot)
+  },
+  by = c('add_players' = 'player_name')) %>%
+  left_join(y = {
+    select(player_lookups, player_name, headshot)
+  },
+  by = c('drop_players' = 'player_name')) %>%
+  mutate(value_added = val.x - val.y) %>%
+  arrange(-value_added) %>%
+  relocate(add_players, headshot.x,pos.x, drop_players, headshot.y, pos.y) %>%
+  # table
+  gt() %>%
+  # labels
+  cols_label(
+    add_players = "Add Player",
+    drop_players = "Drop Player",
+    pos.x = "Add Pos",
+    pos.y = "Drop Pos",
+    val.x = "Add Value",
+    val.y = "Drop Value",
+    headshot.x = "",
+    headshot.y = "",
+    value_added = "Value Added"
+  ) %>%
+  # img
+  gt_img_rows(columns = c(headshot.x)) %>%
+  gt_img_rows(columns = c(headshot.y)) %>%
+  gt_plt_dumbbell(col1 = val.y,
+                  col2 = val.x,
+                  label = "Value Difference") %>%
+  # theming
+  tab_spanner(label = "Player to Add", columns = 1:pos.x) %>%
+  tab_spanner(label = "Player to Drop", columns = drop_players:pos.y) %>%
+  gt_theme_538()
+
+```
+
+## Lineup Analysis
+
+```{r}
+
+all_lineups <- all_owned_players %>%
+  group_by(franchise_name) %>%
+  nest() %>%
+  mutate(opt_lineups = map(
+    data,
+    \(x) opt_lineup(
+      id = x$player_id,
+      pos = x$pos,
+      val = x$value_2qb
+    )
+  )) %>%
+  ungroup() %>%
+  select(-data) %>%
+  unnest(opt_lineups) %>%
+  mutate(slot_rank = scales::rescale(val), .by = slot) %>%
+  mutate(starter_rank = scales::rescale(val), .by = starter) %>%
+  mutate(pos_rank = scales::rescale(val), .by = pos) %>%
+  left_join(y = {
+    select(player_lookups, id = player_id, player_name, headshot)
+  }) %>%
+  relocate(player_name, headshot, .after = id) %>%
+  mutate(row_id = row_number()) %>%
+  group_by(franchise_name, slot) %>%
+  arrange(-val, .by_group = T) %>%
+  ungroup() %>%
+  mutate(row_id = if_else(is.na(slot), na_int, row_id)) %>%
+  arrange(row_id, -val) %>%
+  select(-row_id)
+
+
+```
+
+### Team Weakness and Strength
+
+```{r}
+
+all_lineups %>%
+  filter(franchise_name == TEAM) %>%
+  select(-c(franchise_name, rank, starter, pos)) %>%
+  # table
+  gt() %>%
+  # img
+  gt_img_rows(headshot) %>%
+  # labels
+  cols_hide(id) %>%
+  cols_label(player_name = "player_name",
+             headshot = "",
+             val = "Player Value",
+             slot_rank = "Slot Rank",
+             starter_rank = "Starter Rank",
+             pos_rank = "Pos Rank") %>%
+  cols_align(columns = headshot, align = "left") %>%
+  tab_style(
+    style = cell_borders(
+      sides = c("bottom"),
+      color = "black",
+      weight = px(2),
+      style = "solid"
+    ),
+    locations = cells_body(rows = slot == "super1")
+  ) %>%
+  # fmt
+  fmt_percent(columns = c(slot_rank, starter_rank, pos_rank)) %>%
+  sub_missing(missing_text = "--") %>%
+  # colors
+  data_color(columns = c(val, slot_rank, starter_rank, pos_rank), 
+             palette = c(pred, pgreen)) %>%
+  # theme
+  gt_theme_538()
+  
+```
+
+### Worst Slots
+
+```{r}
+
+
+all_lineups %>%
+  filter(
+    franchise_name == TEAM,
+    !is.na(slot))  %>%
+  slice_min(order_by = slot_rank, n = 5)  %>%
+  select(-c(rank, starter, starter_rank, pos_rank, franchise_name)) %>%
+  # table
+  gt() %>%
+  # labels
+  cols_hide(id) %>%
+  cols_label(player_name = "player_name",
+             headshot = "",
+             val = "Player Value",
+             slot_rank = "Slot Rank") %>%
+  cols_move(pos, after = headshot) %>%
+  # headshot
+  gt_img_rows(headshot) %>%
+  data_color(columns = c(val, slot_rank), 
+             palette = c(pred, pgreen)) %>%
+  # fmt
+  fmt_percent(slot_rank) %>%
+  # theme
+  gt_theme_538()
+
+
+```
+
+## Targets
+
+```{r}
+
+
+
+
+
+```
+
+```{r}
+
+all_lineups %>%
+  select(franchise_name, id, val, starter, pos, player_name) %>%
+  left_join(y = {
+    ffoptim:::create_pos_slot_lookup() %>%
+      select(pos = positions, slot) %>%
+      summarize(slot = list(slot), .by = 'pos')
+  }, by = 'pos') %>%
+  unnest_longer(slot) %>%
+  mutate(slot = str_to_lower(slot)) %>%
+  find_better_players(cur_team = TEAM) %>%
+  filter(starter) %>%
+  mutate(gain = other_val - val) %>%
+  distinct(id, other_id, .keep_all = T) %>%
+  arrange(-gain)  %>%
+  gt()
+
+```
+
+### Best Targets by Position
+
+```{r}
+
+all_lineups %>%
+  select(franchise_name, id, val, starter, pos, player_name) %>%
+  left_join(y = {
+    ffoptim:::create_pos_slot_lookup() %>%
+      select(pos = positions, slot) %>%
+      summarize(slot = list(slot), .by = 'pos')
+  }, by = 'pos') %>%
+  unnest_longer(slot) %>%
+  mutate(slot = str_to_lower(slot)) %>%
+  find_better_non_starters(cur_team = TEAM) %>%
+  mutate(gain = other_val - val) %>%
+  distinct(id, other_id, .keep_all = T) %>%
+  arrange(-gain) %>%
+  # table
+  gt() %>%
+  # labels
+  cols_hide(c(franchise_name, id, starter, slot, other_id)) %>%
+  cols_move_to_start(c(
+    pos,
+    player_name,
+    other_player_name,
+    other_franchise_name,
+    val,
+    gain
+  )) %>%
+  # coloring
+  gt_hulk_col_numeric(gain) %>%
+  gt_plt_dumbbell(col1 = val,
+                  col2 = other_val,
+                  label = "Value Difference") %>%
+  # theming
+  gt_theme_538()
+
+```
+
+## Best Transactions
+
+```{r}
+
+make_all_trade_candidates(scale = F, 
+                          window = 500) %>%
+  select(
+    franchise_name.y,
+    player_name.x,
+         player_name.y,
+         self_val.x,
+         self_val.y,
+         self_raw_gain) %>%
+  slice_max(n = 100, order_by = self_raw_gain) %>%
+  # table
+  gt() %>%
+  # format
+  # fmt_percent(columns = c(self_val.x, self_val.y, self_raw_gain)) %>%
+  # labels
+  cols_label(player_name.x = "Owned Asset", player_name.y = "Opp Asset", self_val.x = "Owned Value", self_val.y = "Opp Value", self_raw_gain = "Value Gained") %>%
+  tab_footnote("Value as percent rank. 100% indicates the best possible value.", locations = cells_column_labels(c(self_val.x, self_val.y))) %>%
+  tab_footnote("Increase in percentage points if owned asset is swapped.", locations = cells_column_labels(self_raw_gain)) %>%
+  # theming
+  gt_theme_538()
+
+```

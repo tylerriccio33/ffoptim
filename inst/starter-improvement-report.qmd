@@ -1,0 +1,306 @@
+---
+title: "Starter Improvement Report"
+format: html
+editor: visual
+echo: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+
+library(ffoptim)
+library(tidyverse)
+library(glue)
+library(gt)
+library(powerjoin)
+library(gtExtras)
+library(RColorBrewer)
+
+TEAM <- 'Black Wilson'
+pal <- RColorBrewer::brewer.pal(n = 8, name = "Set2")
+RColorBrewer::display.brewer.pal(n = 8, name = "Set2")
+pgreen <- "#A6D854"
+pred <- "#FC8D62"
+color_scale <- adjust_luminance(RColorBrewer::brewer.pal(n = 11, name = "RdYlGn"), +1)
+
+
+# Pull Lookups #
+all_owned_assets <- FFDATA$all_rostered_assets %>%
+  select(-c(roster, picks)) %>%
+  unnest(all_assets) %>%
+  mutate(
+    player_id = if_else(is.na(player_id), glue("raw_pick--{raw_pick}"), player_id),
+    player_name = if_else(is.na(player_id), player_id, player_name),
+    pos = if_else(str_detect(player_id, "^raw_pick--"), "PICK", pos)
+  )
+nested_assets <- nest_assets(all_owned_assets,
+           player_name,
+           pos,
+           id = player_id,
+           val = value_2qb, 
+           .key = 'roster')
+all_owned_players <- all_owned_assets %>%
+  filter(!str_detect(player_name, "^raw_pick--")) %>%
+  mutate(scaled_value = scales::rescale(value_2qb))
+all_owned_draft_picks <-
+  anti_join(all_owned_assets, all_owned_players, by = join_by(player_id)) %>%
+  janitor::remove_empty('cols')
+all_unowned_players <- FFDATA$non_rostered %>%
+  rename(player_id = id,
+         player_name = player)
+all_league_players <-
+  bind_rows(all_owned_players, all_unowned_players) %>%
+  janitor::remove_empty('cols')
+all_league_assets <-
+  bind_rows(all_league_players, all_owned_draft_picks) %>%
+  janitor::remove_empty('cols')
+
+# Current Team Lookups #
+cur_roster <- all_owned_players %>%
+  filter(franchise_name == TEAM)
+cur_lineup <- opt_lineup(id = cur_roster$player_id,
+                         pos = cur_roster$pos,
+                         val = cur_roster$value_2qb) %>%
+  rename(player_id = id) %>%
+  power_left_join(y = {
+    cur_roster
+  },
+  by = join_by(player_id),
+  conflict = coalesce_xy)
+
+# Addatives #
+player_lookups <- nflreadr::load_ff_playerids() %>%
+  select(player_id = sleeper_id,
+         player_name = name,
+         team,
+         gsis_id) %>%
+  left_join(y = {
+    nflreadr::load_players() %>%
+      select(gsis_id,
+             headshot) %>%
+      drop_na()
+  })
+
+
+```
+
+```{r}
+
+# create lineups from rosters
+
+lineups <- build_lineups_from_rosters(all_owned_players)
+
+
+```
+
+```{r}
+
+trade_targets <- lineups %>%
+  select(franchise_name, id, val, starter, pos, player_name) %>%
+  find_better_players(cur_team = TEAM) %>%
+  filter(starter) %>%
+  # append roster lookups of values
+  left_join(y = nested_assets) %>%
+  left_join(y = nested_assets,
+            by = join_by(other_franchise_name == franchise_name)) %>%
+  rename(roster = roster.x,
+         other_roster = roster.y) %>%
+  
+  slice_head(n = 5)  %>%
+  
+  # calculate value needed to make up
+  mutate(value_needed = other_val - val) %>%
+  # remove player already being traded from roster
+  mutate(roster_without_base_player = map2(id, roster, \(x, y) filter(y, .data$id != x))) %>%
+  # create trade packages
+  mutate(
+    trade_packages = map2(
+      value_needed,
+      roster_without_base_player,
+      \(x, y) create_trade_packages(
+        value_needed = x,
+        window = 500,
+        roster_lookup = y,
+        max_combn = 2
+      ),
+      .progress = T
+    )
+  )  %>%
+  mutate(trade_packages = pmap(list(trade_packages, id, val, player_name), ~ 
+                                 add_base_to_combos(trade_packages = ..1,
+                               base_id = ..2,
+                               base_val = ..3,
+                               base_player_name = ..4))) %>%
+  slice_head(n = 5)  %>%
+  # optimize lineups before trades
+  mutate(
+    roster = map(roster, \(x) opt_lineup(
+      id = x$id,
+      pos = x$pos,
+      val = x$val
+    )),
+    other_roster = map(other_roster, \(x) opt_lineup(
+      id = x$id,
+      pos = x$pos,
+      val = x$val
+    ))
+  ) %>%
+  # for each base 1:1 transaction, execute all combos and add values
+  mutate(trade_packages = pmap(list(
+    roster, other_roster, trade_packages, other_id
+  ), ~ {
+    roster <- ..1
+    other_roster <- ..2
+    cur_trade_packages <- ..3
+    cur_other_player <- ..4
+
+    # calculate pre package values
+    pre_cur <- calc_total_roster_values(roster)
+    pre_other <- calc_total_roster_values(other_roster)
+    combo_values <-
+      derive_value_added_per_combo(
+        cur_trade_packages = cur_trade_packages,
+        pre_cur = pre_cur,
+        pre_other = pre_other,
+        roster = roster,
+        other_roster = other_roster,
+        cur_other_player = cur_other_player
+      )
+    # join combo values to trade packages
+    combo_values <- enframe(combo_values, name = 'combo')
+    joined_packages <- left_join(cur_trade_packages,
+                                 combo_values,
+                                 by = 'combo') %>%
+      unnest_wider(col = value)
+    return(joined_packages)
+  }, .progress = T))
+
+
+```
+
+```{r}
+
+trade_gt_data <- trade_targets %>%
+  select(player_name, val, other_player_name, other_val, trade_packages) %>%
+  unnest(trade_packages, names_sep = "_") %>%
+  filter(
+    trade_packages_starter_value >= 0,
+    trade_packages_other_starter_value >= -2000,
+    trade_packages_total_value >= -1000,
+    trade_packages_other_total_value >= -1000
+  ) %>%
+  select(-c(player_name, val, trade_packages_id)) %>%
+  slice_head(n = 100) %>%
+  group_by(trade_packages_combo) %>% 
+  summarize(
+    players = list(trade_packages_player_name),
+    vals = list(trade_packages_val),
+    across(where( ~ all_identical(.x)), \(x) first(x)),
+  ) %>%
+  select(-c(trade_packages_player_name, trade_packages_val)) %>%
+  unnest_wider(players, names_sep = "") %>%
+  unnest_wider(vals, names_sep = "")
+
+
+trade_gt_data
+
+# reorder ID col based on value column
+relocate_key_by_value <- function(data, key_cols, val_cols) {
+  key_cols <- enexprs(key_cols)
+  val_cols <- enexprs(val_cols)
+  
+  if (vec_size(key_cols) != vec_size(val_cols)) {
+    cli_abort(
+      c("{.var key_cols} and {.var val_cols} must have the same size.",
+        i = "These variables correspond to eachother i.e. the positions are the keys and values.")
+    )
+  }
+  
+  # @staticmethod
+  build_row_dict <- function(keys, vals) {
+    l <- list(vals)
+    names(l) <- keys
+    return(l)
+  }
+  build_row_dict.tibble <- function(data, keys, vals) {
+    nested <- data %>%
+      group_by(row_number()) %>%
+      nest() %>%
+      mutate(dict = map(data, ~ {
+        dt <- .x
+  browser()
+        key_vec <- pull(dt, !!keys)
+        return(key_vec)
+        # val_vec <- pull(dt, {{vals}})
+        build_row_dict(keys = key_vec, vals = val_vec)
+      }))
+    return(nested)
+  }
+  
+  
+  data %>%
+    build_row_dict.tibble(keys = key_cols,
+                          vals = val_cols)
+  
+  
+}
+
+
+trade_gt_data %>%
+  relocate_key_by_value(
+    key_cols = c(players1, players2, players3),
+    val_cols = c(vals1, vals2, vals3)
+  )
+
+
+trade_gt_data %>%
+  # table
+  gt() %>%
+  # labels
+  cols_hide(trade_packages_combo) %>%
+  cols_label(
+    players1 = "Player 1",
+    players2 = "Player 2",
+    players3 = "Player 3",
+    other_player_name = "Target",
+    trade_packages_starter_value = "Team",
+    trade_packages_other_starter_value = "Other",
+    trade_packages_total_value = "Team",
+    trade_packages_other_total_value = "Other"
+  ) %>%
+  cols_move_to_start(other_player_name) %>%
+  # spans and divs
+  tab_spanner(label = "Starter Value Added", columns = c(trade_packages_starter_value, trade_packages_other_starter_value)) %>%
+  tab_spanner(label = "Total Value Added", columns = c(trade_packages_total_value, trade_packages_other_total_value)) %>%
+  tab_spanner(label = "Players", columns = starts_with("player")) %>%
+  tab_header(title = "Best Trade Packages",
+             subtitle = "Multi-player trade packages, using up to 3 players for a single target.") %>%
+  gtExtras::gt_add_divider(other_player_name,
+                           sides = 'right',
+                           color = 'lightgrey') %>%
+  gtExtras::gt_add_divider(players3,
+                           sides = 'right',
+                           color = 'lightgrey') %>%
+  gtExtras::gt_add_divider(trade_packages_other_starter_value,
+                           sides = 'right',
+                           color = 'lightgrey') %>%
+  # fmt
+  sub_missing() %>%
+  # merge values under players
+  gtExtras::gt_merge_stack(players1, vals1) %>%
+  gtExtras::gt_merge_stack(players2, vals2) %>%
+  gtExtras::gt_merge_stack(players3, vals3) %>%
+  gtExtras::gt_merge_stack(other_player_name, other_val) %>%
+  # colors
+  data_color(
+    columns = ends_with('_value'), 
+    method = "numeric",
+    palette = color_scale
+  ) %>%
+  # theming
+  gt_theme_espn()
+# opt_interactive(use_pagination = F, use_sorting = T, use_search = T)
+
+
+```
